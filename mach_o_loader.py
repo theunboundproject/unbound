@@ -153,6 +153,7 @@ class MachOLoader:
         self.symbol_bridge_by_name: Dict[str, int] = {}
         self.heap_base = 0x6000000
         self.heap_next = self.heap_base
+        self.runloop_addr = 0x7000000
         self.handlers: Dict[str, Callable] = self._default_handlers()
 
     def _parse(self) -> MachOImage:
@@ -500,6 +501,7 @@ class MachOLoader:
             print(
                 f"[Unbound] UIApplicationMain argc={argc} argv={hex(argv)} principal={hex(principal)} delegate={hex(delegate)}"
             )
+            mu.reg_write(UC_ARM64_REG_X30, self.runloop_addr)
             return 0
 
         def nsstring_from_class(mu, state):
@@ -538,6 +540,12 @@ class MachOLoader:
             "dispatch_get_global_queue": return_zero,
             "_dispatch_main": return_zero,
             "dispatch_main": return_zero,
+            "_CFRunLoopRun": return_zero,
+            "CFRunLoopRun": return_zero,
+            "_CFRunLoopRunInMode": return_zero,
+            "CFRunLoopRunInMode": return_zero,
+            "_CFRunLoopGetCurrent": return_zero,
+            "CFRunLoopGetCurrent": return_zero,
             "_dispatch_semaphore_create": return_zero,
             "dispatch_semaphore_create": return_zero,
             "_dispatch_semaphore_signal": return_zero,

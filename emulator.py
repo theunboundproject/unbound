@@ -12,10 +12,15 @@ from mach_o_loader import MachOLoader
 STACK_ADDR = 0x2000000
 STACK_SIZE = 2 * 1024 * 1024
 SENTINEL_RET_ADDR = 0x4000000
+RUNLOOP_ADDR = 0x7000000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BINARY = os.path.join(BASE_DIR, "Payload", "calculator.app", "calculator")
+MAIN_EXECUTION_BUDGET = 5000000
+TRACE_INSTRUCTION_LIMIT = 400
 
 md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+_RUNLOOP_LOGGED = False
+_TRACE_COUNT = 0
 
 
 def hook_mem_invalid(mu, access, address, size, value, user_data):
@@ -53,8 +58,16 @@ def hook_mem_invalid(mu, access, address, size, value, user_data):
 
 
 def hook_code(loader: MachOLoader, mu, address, size, user_data):
+    global _RUNLOOP_LOGGED, _TRACE_COUNT
+
     if address == SENTINEL_RET_ADDR:
         mu.emu_stop()
+        return
+
+    if address == RUNLOOP_ADDR:
+        if not _RUNLOOP_LOGGED:
+            print("[Unbound] entered synthetic UIKit run loop")
+            _RUNLOOP_LOGGED = True
         return
 
     if loader.dispatch_bridge(mu, address):
@@ -63,9 +76,15 @@ def hook_code(loader: MachOLoader, mu, address, size, user_data):
     if loader.dispatch_stub(mu, address):
         return
 
+    if _TRACE_COUNT >= TRACE_INSTRUCTION_LIMIT:
+        return
+
     code_bytes = mu.mem_read(address, size)
     for instruction in md.disasm(code_bytes, address):
         print(f"--- {hex(instruction.address)}: {instruction.mnemonic}\t{instruction.op_str}")
+        _TRACE_COUNT += 1
+        if _TRACE_COUNT >= TRACE_INSTRUCTION_LIMIT:
+            break
 
 
 def call_function(mu, address: int):
@@ -94,6 +113,8 @@ def run_unbound(binary_path: str = DEFAULT_BINARY):
     mu.mem_map(STACK_ADDR, STACK_SIZE)
     mu.mem_map(SENTINEL_RET_ADDR, 4096, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC)
     mu.mem_write(SENTINEL_RET_ADDR, b"\xc0\x03\x5f\xd6")
+    mu.mem_map(RUNLOOP_ADDR, 4096, UC_PROT_READ | UC_PROT_EXEC)
+    mu.mem_write(RUNLOOP_ADDR, b"\x00\x00\x00\x14" * (4096 // 4))
 
     mu.hook_add(
         UC_HOOK_MEM_READ_UNMAPPED
@@ -112,7 +133,7 @@ def run_unbound(binary_path: str = DEFAULT_BINARY):
     print(f"🚀 Starting emulation at {hex(entry_point)} from {binary_path}\n")
 
     try:
-        mu.emu_start(entry_point, 0xFFFFFFFFFFFFFFFF)
+        mu.emu_start(entry_point, 0xFFFFFFFFFFFFFFFF, count=MAIN_EXECUTION_BUDGET)
     except UcError as error:
         pc = mu.reg_read(UC_ARM64_REG_PC)
         if pc not in (0, SENTINEL_RET_ADDR):
