@@ -1,111 +1,123 @@
+from __future__ import annotations
+
+import os
+
+from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
 from unicorn import *
 from unicorn.arm64_const import *
-from capstone import *
-import struct
 
-# --- Configuration ---
-ADDRESS         = 0x1000000  
-STACK_ADDR      = 0x2000000 
-STACK_SIZE      = 2 * 1024 * 1024 
-DUMMY_FUNC_ADDR = 0x4000000 
-ENTRY_OFFSET    = 0x96d8
-STUB_LOOP_ADDR  = 0x10086f0 
+from mach_o_loader import MachOLoader
+
+
+STACK_ADDR = 0x2000000
+STACK_SIZE = 2 * 1024 * 1024
+SENTINEL_RET_ADDR = 0x4000000
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_BINARY = os.path.join(BASE_DIR, "Payload", "calculator.app", "calculator")
 
 md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+
 
 def hook_mem_invalid(mu, access, address, size, value, user_data):
     pc = mu.reg_read(UC_ARM64_REG_PC)
     lr = mu.reg_read(UC_ARM64_REG_X30)
-    
-    if access == UC_MEM_FETCH_UNMAPPED:
-        # Graceful Exit: Check if we finished the main function
-        if address == 0:
-            if lr == 0:
-                print("\n[Unbound] 🏁 SUCCESS: Main function reached final return. Stopping.")
-                mu.emu_stop()
-                return False
-            else:
-                # Attempt recovery if the Link Register has a valid return path
-                mu.reg_write(UC_ARM64_REG_PC, lr)
-                return True
+    page_base = address & ~0xFFF
 
-        # Redirect any other unmapped fetches (library calls) to our Safe Zone
-        mu.reg_write(UC_ARM64_REG_PC, DUMMY_FUNC_ADDR)
+    if access == UC_MEM_WRITE_PROT:
+        try:
+            mu.mem_protect(page_base, 0x1000, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC)
+            return True
+        except UcError:
+            mu.emu_stop()
+            return False
+
+    if access == UC_MEM_FETCH_UNMAPPED:
+        if address == 0 or lr == 0:
+            print("\n[Unbound] execution reached an unmapped return path. Stopping.")
+            mu.emu_stop()
+            return False
+
+        mu.reg_write(UC_ARM64_REG_PC, SENTINEL_RET_ADDR)
         return True
 
-    # Handle unmapped Data Reads/Writes by skipping the instruction
+    if access in (UC_MEM_READ_UNMAPPED, UC_MEM_WRITE_UNMAPPED):
+        try:
+            mu.mem_map(page_base, 0x1000, UC_PROT_READ | UC_PROT_WRITE)
+            return True
+        except UcError:
+            mu.reg_write(UC_ARM64_REG_PC, pc + 4)
+            return True
+
     mu.reg_write(UC_ARM64_REG_PC, pc + 4)
     return True
 
-def hook_code(mu, address, size, user_data):
-    # Specialized fix for the infinite LDR loop stub
-    if address == STUB_LOOP_ADDR:
-        mu.reg_write(UC_ARM64_REG_X8, DUMMY_FUNC_ADDR)
-        mu.reg_write(UC_ARM64_REG_PC, address + 4)
+
+def hook_code(loader: MachOLoader, mu, address, size, user_data):
+    if address == SENTINEL_RET_ADDR:
+        mu.emu_stop()
         return
 
-    # Don't log instructions inside the Safe Zone to keep output clean
-    if address == DUMMY_FUNC_ADDR:
+    if loader.dispatch_bridge(mu, address):
         return
 
-    # Instruction Tracer
+    if loader.dispatch_stub(mu, address):
+        return
+
     code_bytes = mu.mem_read(address, size)
-    for i in md.disasm(code_bytes, address):
-        print(f"--- {hex(i.address)}: {i.mnemonic}\t{i.op_str}")
+    for instruction in md.disasm(code_bytes, address):
+        print(f"--- {hex(instruction.address)}: {instruction.mnemonic}\t{instruction.op_str}")
 
-def run_unbound():
-    mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
-    
-    # Setup Memory Map
-    mu.mem_map(ADDRESS, 16 * 1024 * 1024) 
-    mu.mem_map(STACK_ADDR, STACK_SIZE)
-    mu.mem_map(DUMMY_FUNC_ADDR, 4096)
-    
-    # Initialize Safe Zone with a 'RET' instruction (\xc0\x03\x5f\xd6)
-    mu.mem_write(DUMMY_FUNC_ADDR, b'\xc0\x03\x5f\xd6')
 
+def call_function(mu, address: int):
+    saved_sp = mu.reg_read(UC_ARM64_REG_SP)
+    saved_lr = mu.reg_read(UC_ARM64_REG_X30)
+
+    mu.reg_write(UC_ARM64_REG_X30, SENTINEL_RET_ADDR)
     try:
-        with open("code.bin", "rb") as f:
-            mu.mem_write(ADDRESS, f.read())
-    except FileNotFoundError:
-        print("❌ Error: 'code.bin' not found.")
-        return
-
-    # --- Import Table Simulation ---
-    # We pre-fill these specific memory slots with the Safe Zone address
-    # so that 'br x16' style jumps land safely in our RET handler.
-    VOID_SLOTS = [
-        0x100c090, 
-        0x100c000 + 0x50, 
-        0x100c198, 
-        0x100c098 
-    ] 
-    
-    for slot in VOID_SLOTS:
-        try:
-            mu.mem_write(slot, struct.pack('<Q', DUMMY_FUNC_ADDR))
-        except Exception:
-            pass
-
-    # Register Hooks
-    mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED | 
-                UC_HOOK_MEM_WRITE_UNMAPPED | 
-                UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_invalid)
-    mu.hook_add(UC_HOOK_CODE, hook_code)
-    
-    # Initialize CPU State
-    mu.reg_write(UC_ARM64_REG_SP, STACK_ADDR + STACK_SIZE)
-    current_pc = ADDRESS + ENTRY_OFFSET
-    
-    print(f"🚀 Starting emulation at {hex(current_pc)}...\n")
-
-    try:
-        # Start the engine
-        mu.emu_start(current_pc, 0xFFFFFFFFFFFFFFFF)
-    except UcError as e:
+        mu.emu_start(address, SENTINEL_RET_ADDR)
+    except UcError as error:
         pc = mu.reg_read(UC_ARM64_REG_PC)
-        if pc != 0:
-            print(f"⚠️ Emulation stopped at {hex(pc)}: {e}")
+        if pc != SENTINEL_RET_ADDR:
+            print(f"[Unbound] initializer at {hex(address)} stopped at {hex(pc)}: {error}")
+    finally:
+        mu.reg_write(UC_ARM64_REG_SP, saved_sp)
+        mu.reg_write(UC_ARM64_REG_X30, saved_lr)
+
+
+def run_unbound(binary_path: str = DEFAULT_BINARY):
+    loader = MachOLoader(binary_path)
+
+    mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+    loader.load(mu)
+    loader.bind_symbol_pointers(mu)
+
+    mu.mem_map(STACK_ADDR, STACK_SIZE)
+    mu.mem_map(SENTINEL_RET_ADDR, 4096, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC)
+    mu.mem_write(SENTINEL_RET_ADDR, b"\xc0\x03\x5f\xd6")
+
+    mu.hook_add(
+        UC_HOOK_MEM_READ_UNMAPPED
+        | UC_HOOK_MEM_WRITE_UNMAPPED
+        | UC_HOOK_MEM_FETCH_UNMAPPED
+        | UC_HOOK_MEM_WRITE_PROT,
+        hook_mem_invalid,
+    )
+    mu.hook_add(UC_HOOK_CODE, lambda mu_, address, size, user_data: hook_code(loader, mu_, address, size, user_data))
+
+    mu.reg_write(UC_ARM64_REG_SP, STACK_ADDR + STACK_SIZE)
+
+    loader.call_initializers(mu, lambda func_addr: call_function(mu, func_addr))
+
+    entry_point = loader.get_entry_point()
+    print(f"🚀 Starting emulation at {hex(entry_point)} from {binary_path}\n")
+
+    try:
+        mu.emu_start(entry_point, 0xFFFFFFFFFFFFFFFF)
+    except UcError as error:
+        pc = mu.reg_read(UC_ARM64_REG_PC)
+        if pc not in (0, SENTINEL_RET_ADDR):
+            print(f"⚠️ Emulation stopped at {hex(pc)}: {error}")
+
 
 if __name__ == "__main__":
     run_unbound()
